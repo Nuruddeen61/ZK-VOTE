@@ -6,6 +6,7 @@ use soroban_sdk::{
 };
 
 const DAO_COUNT: Symbol = symbol_short!("dao_cnt");
+const LOCK: Symbol = symbol_short!("lock");
 // #592 deployer attestation: registry publishes its own code hash so voting
 // contracts can pin it per-DAO (registry_hash) instead of trusting any
 // contract id that answers get_admin.
@@ -61,6 +62,7 @@ pub enum RegistryError {
     DuplicateSigner = 17,
     InvalidThreshold = 18,
     SignerNotFound = 19,
+    Reentrancy = 20,
 }
 
 // Size limit to prevent DoS attacks
@@ -318,6 +320,21 @@ impl DaoRegistry {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+    }
+    fn enter(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&LOCK)
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, RegistryError::Reentrancy);
+        }
+        env.storage().instance().set(&LOCK, &true);
+    }
+
+    fn exit(env: &Env) {
+        env.storage().instance().set(&LOCK, &false);
     }
 
     fn bump_persistent<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
