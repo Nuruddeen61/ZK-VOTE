@@ -10,6 +10,7 @@ mod poseidon_params_bls12_381;
 const SBT_CONTRACT: Symbol = symbol_short!("sbt");
 const REGISTRY: Symbol = symbol_short!("registry");
 const VOTING_CONTRACT_KEY: Symbol = symbol_short!("voting");
+const LOCK: Symbol = symbol_short!("lock");
 const DEFAULT_MAX_ROOTS: u32 = 30;
 const MIN_MAX_ROOTS: u32 = 10;
 const MAX_MAX_ROOTS: u32 = 100;
@@ -91,6 +92,8 @@ pub enum TreeError {
     PqCommitmentExists = 21,
     /// Poseidon field symbol is not a supported field
     InvalidField = 22,
+    /// A guarded entrypoint was re-entered while it was already running (#521)
+    Reentrancy = 23,
 }
 
 #[contracttype]
@@ -213,6 +216,24 @@ impl MembershipTree {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
     }
 
+    /// Reentrancy guard (#521): take the lock, or revert if already held.
+    fn enter(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&LOCK)
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, TreeError::Reentrancy);
+        }
+        env.storage().instance().set(&LOCK, &true);
+    }
+
+    /// Reentrancy guard (#521): release the lock.
+    fn exit(env: &Env) {
+        env.storage().instance().set(&LOCK, &false);
+    }
+
     fn bump_persistent<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
         env.storage()
             .persistent()
@@ -251,6 +272,7 @@ impl MembershipTree {
     /// Configure MAX_ROOTS per DAO (range 10–100). Only DAO admin.
     pub fn set_max_roots(env: Env, dao_id: u64, new_max: u32, admin: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         admin.require_auth();
         let sbt_contract = Self::sbt_contract(&env);
         let registry: Address = env.invoke_contract(
@@ -272,6 +294,7 @@ impl MembershipTree {
         let key = DataKey::MaxRoots(dao_id);
         env.storage().persistent().set(&key, &new_max);
         Self::bump_persistent(&env, &key);
+        Self::exit(&env);
     }
 
     /// Get configured MAX_ROOTS for a DAO.
@@ -381,6 +404,7 @@ impl MembershipTree {
     /// `field` is `"BN254"` or `"BLS12_381"`
     pub fn init_tree(env: Env, dao_id: u64, depth: u32, field: Symbol, admin: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         admin.require_auth();
 
         // Verify admin owns the DAO via SBT -> Registry chain
@@ -460,6 +484,8 @@ impl MembershipTree {
             root_index: 0,
         }
         .publish(&env);
+
+        Self::exit(&env);
     }
 
     /// Initialize tree from registry during DAO initialization
@@ -468,6 +494,7 @@ impl MembershipTree {
     /// `field` is `"BN254"` or `"BLS12_381"`
     pub fn init_tree_from_registry(env: Env, dao_id: u64, depth: u32, field: Symbol) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         // Verify caller is the registry contract
         let registry: Address = env
             .storage()
@@ -535,6 +562,8 @@ impl MembershipTree {
             root_index: 0,
         }
         .publish(&env);
+
+        Self::exit(&env);
     }
 
     fn reserve_commitment(env: &Env, dao_id: u64, commitment: &U256) {
@@ -582,6 +611,7 @@ impl MembershipTree {
     /// The registry is trusted to have already verified SBT ownership.
     pub fn register_from_registry(env: Env, dao_id: u64, commitment: U256, member: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         // Verify caller is the registry contract
         let registry: Address = env
             .storage()
@@ -659,11 +689,14 @@ impl MembershipTree {
         .publish(&env);
 
         Self::record_registration(&env, dao_id, &member);
+
+        Self::exit(&env);
     }
 
     /// Register a commitment with explicit caller (requires SBT membership)
     pub fn register_with_caller(env: Env, dao_id: u64, commitment: U256, caller: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         caller.require_auth();
 
         // Verify caller has SBT for this DAO
@@ -748,12 +781,15 @@ impl MembershipTree {
         .publish(&env);
 
         Self::record_registration(&env, dao_id, &caller);
+
+        Self::exit(&env);
     }
 
     /// Self-register a commitment in a public DAO (requires SBT membership)
     /// For public DAOs, anyone with an SBT can register their commitment
     pub fn self_register(env: Env, dao_id: u64, commitment: U256, member: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         member.require_auth();
 
         // Get SBT contract and verify membership
@@ -856,6 +892,8 @@ impl MembershipTree {
         .publish(&env);
 
         Self::record_registration(&env, dao_id, &member);
+
+        Self::exit(&env);
     }
 
     /// Get current root for a DAO
@@ -1122,6 +1160,7 @@ impl MembershipTree {
     /// This zeros the leaf in the Merkle tree, preventing proofs against new roots
     pub fn remove_member(env: Env, dao_id: u64, member: Address, admin: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         admin.require_auth();
 
         // Verify admin owns the DAO via SBT -> Registry chain
@@ -1190,6 +1229,8 @@ impl MembershipTree {
             root_index,
         }
         .publish(&env);
+
+        Self::exit(&env);
     }
 
     /// Reinstate a previously removed member
@@ -1197,6 +1238,7 @@ impl MembershipTree {
     /// The admin should also re-mint their SBT via the membership-sbt contract
     pub fn reinstate_member(env: Env, dao_id: u64, member: Address, admin: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         admin.require_auth();
 
         // Verify admin is the DAO admin via cross-contract call
@@ -1250,6 +1292,8 @@ impl MembershipTree {
             reinstated_at,
         }
         .publish(&env);
+
+        Self::exit(&env);
     }
 
     /// Get revocation timestamp for a commitment (returns None if never revoked)
@@ -2019,6 +2063,7 @@ impl MembershipTree {
     /// dual-tree verification is opt-in via the new circuit.
     pub fn migrate_roots_to_pq(env: Env, dao_id: u64, admin: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         admin.require_auth();
 
         // Verify admin via SBT -> registry chain
@@ -2078,6 +2123,8 @@ impl MembershipTree {
         let next_key = DataKey::Sha3NextRootIdx(dao_id);
         env.storage().persistent().set(&next_key, &next_idx);
         Self::bump_persistent(&env, &next_key);
+
+        Self::exit(&env);
     }
 
     /// Get SHA3-256 PQ root history for a DAO.
