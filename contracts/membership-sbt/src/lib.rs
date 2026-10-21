@@ -5,6 +5,7 @@ use soroban_sdk::{
 };
 
 const REGISTRY: Symbol = symbol_short!("registry");
+const LOCK: Symbol = symbol_short!("lock");
 // #593 SBT metadata is content-addressed AND hash-pinned: token URI must carry
 // metadata_hash (sha256 of sanitized JSON); renderers reject SVG/script payloads
 // and only render via sandboxed <img>. Upload pipeline enforces
@@ -112,6 +113,8 @@ pub enum SbtError {
     InvalidWeightCurve = 10,
     /// Admin has exceeded the per-epoch mint cap for this DAO (#770).
     MintRateLimitExceeded = 11,
+    /// A guarded entrypoint was re-entered while it was already running (#521).
+    Reentrancy = 12,
 }
 
 #[contracttype]
@@ -198,6 +201,24 @@ impl MembershipSbt {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+    }
+
+    /// Reentrancy guard (#521): take the lock, or revert if already held.
+    fn enter(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&LOCK)
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, SbtError::Reentrancy);
+        }
+        env.storage().instance().set(&LOCK, &true);
+    }
+
+    /// Reentrancy guard (#521): release the lock.
+    fn exit(env: &Env) {
+        env.storage().instance().set(&LOCK, &false);
     }
 
     /// Refresh one record's TTL to the protocol ceiling.
@@ -297,6 +318,7 @@ impl MembershipSbt {
         encrypted_alias: Option<soroban_sdk::String>,
     ) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         // Verify admin authorization
         admin.require_auth();
 
@@ -359,6 +381,8 @@ impl MembershipSbt {
         // Anchor SBT age on first mint (#301)
         Self::record_mint_time(&env, dao_id, &to);
 
+        Self::exit(&env);
+
         SbtMintEvent { dao_id, to }.publish(&env);
     }
 
@@ -373,6 +397,7 @@ impl MembershipSbt {
         let registry = Self::registry_addr(&env);
         registry.require_auth();
         Self::bump_instance(&env);
+        Self::enter(&env);
         // Check not already minted
         if Self::has(env.clone(), dao_id, to.clone()) {
             panic_with_error!(&env, SbtError::AlreadyMinted);
@@ -387,6 +412,8 @@ impl MembershipSbt {
 
         // Anchor SBT age on first mint (#301)
         Self::record_mint_time(&env, dao_id, &to);
+
+        Self::exit(&env);
 
         SbtMintEvent { dao_id, to }.publish(&env);
     }
@@ -428,6 +455,7 @@ impl MembershipSbt {
     /// Sets revocation flag, keeping member entry and alias intact
     pub fn revoke(env: Env, dao_id: u64, member: Address, admin: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         // Verify admin authorization
         admin.require_auth();
 
@@ -453,6 +481,8 @@ impl MembershipSbt {
         let revoked_key = DataKey::Revoked(dao_id, member.clone());
         env.storage().persistent().set(&revoked_key, &true);
         Self::bump_persistent(&env, &revoked_key);
+
+        Self::exit(&env);
 
         SbtRevokeEvent { dao_id, member }.publish(&env);
     }
@@ -497,6 +527,7 @@ impl MembershipSbt {
         encrypted_alias: Option<soroban_sdk::String>,
     ) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         // Member must authorize
         member.require_auth();
 
@@ -547,6 +578,8 @@ impl MembershipSbt {
         // Anchor SBT age on first mint (#301)
         Self::record_mint_time(&env, dao_id, &member);
 
+        Self::exit(&env);
+
         SbtMintEvent { dao_id, to: member }.publish(&env);
     }
 
@@ -559,6 +592,7 @@ impl MembershipSbt {
         new_encrypted_alias: soroban_sdk::String,
     ) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         // Verify admin authorization
         admin.require_auth();
 
@@ -586,6 +620,8 @@ impl MembershipSbt {
             .persistent()
             .set(&alias_key, &new_encrypted_alias);
         Self::bump_persistent(&env, &alias_key);
+
+        Self::exit(&env);
     }
 
     /// Get total member count for a DAO
@@ -895,6 +931,7 @@ impl MembershipSbt {
         admin: Address,
     ) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         admin.require_auth();
 
         let registry: Address = Self::registry_addr(&env);
@@ -914,6 +951,8 @@ impl MembershipSbt {
         } else {
             env.storage().persistent().remove(&key);
         }
+
+        Self::exit(&env);
     }
 
     /// Whether an address may accrue/slash reputation for a DAO.
