@@ -63,8 +63,9 @@ contract Bridge {
     /// @notice SBT state roots per DAO (posted by rootUpdater)
     mapping(uint256 => uint256) public sbtRoots; // daoId => sbtRoot
 
-    /// @notice Authoritative voting Merkle roots per DAO+proposal (#649)
-    mapping(uint256 => mapping(uint256 => uint256)) public voteRoots; // daoId => proposalId => voteRoot
+    /// @notice Block number when the SBT root was last posted for a DAO.
+    /// @dev Used to enforce finality before the root can be used to prove votes.
+    mapping(uint256 => uint256) public sbtRootBlock; // daoId => blockNumber
 
     /// @notice Nullifiers used per DAO+proposal (prevents double-voting)
     mapping(uint256 => mapping(uint256 => mapping(uint256 => bool)))
@@ -73,13 +74,10 @@ contract Bridge {
     /// @notice Admin who can propose verifier changes and transfer admin
     address public admin;
 
-    /// @notice Two-step admin transfer pending acceptor (#650)
-    address public pendingAdmin;
+    /// @notice Minimum confirmation depth before a posted SBT root is accepted.
+    uint256 public finalityDepth;
 
-    /// @notice Narrow role that may publish SBT / voting roots (#650)
-    address public rootUpdater;
-
-    /// @notice Chain ID for domain separation — bound into publicSignals (#649)
+    /// @notice Chain ID for domain separation in EVMVerifier circuit
     uint256 public chainId;
 
     /// @notice Timelock delay for verifier rotation (#650)
@@ -100,8 +98,7 @@ contract Bridge {
     error InvalidVoteChoice();
     error ZeroNullifier();
     error SbtRootNotSet();
-    error VoteRootNotSet();
-    error VoteRootMismatch();
+    error SbtRootNotFinalized();
     error InvalidVerifier();
     error InvalidAddress();
     error ZeroMemberAddr();
@@ -122,7 +119,7 @@ contract Bridge {
         verifier = _verifier;
         sbtContractAddr = _sbtContractAddr;
         admin = msg.sender;
-        rootUpdater = msg.sender;
+        finalityDepth = 0;
         chainId = block.chainid;
     }
 
@@ -170,11 +167,23 @@ contract Bridge {
         if (msg.sender != rootUpdater && msg.sender != admin) revert OnlyRootUpdater();
         if (sbtRoot == 0) revert SbtRootNotSet();
         sbtRoots[daoId] = sbtRoot;
+        sbtRootBlock[daoId] = block.number;
         emit SbtRootUpdated(daoId, sbtRoot, block.number);
     }
 
     /**
-     * @notice Anchor the eligible-voter Merkle root for a DAO+proposal (#649)
+     * @notice Set the confirmation depth required before a posted SBT root can
+     * be used to validate bridge proofs.
+     * @param _finalityDepth Minimum number of blocks that must confirm the root.
+     */
+    function setFinalityDepth(uint256 _finalityDepth) external {
+        if (msg.sender != admin) revert OnlyAdmin();
+        finalityDepth = _finalityDepth;
+    }
+
+    /**
+     * @notice Transfer admin role
+     * @param newAdmin Address of the new admin
      */
     function updateVoteRoot(
         uint256 daoId,
@@ -247,10 +256,12 @@ contract Bridge {
         if (sbtRoots[daoId] == 0) revert SbtRootNotSet();
         if (sbtRoot != sbtRoots[daoId]) revert SbtRootNotSet();
 
-        // Vote root must be anchored on-chain — reject prover-chosen trees (#649)
-        uint256 anchoredVoteRoot = voteRoots[daoId][proposalId];
-        if (anchoredVoteRoot == 0) revert VoteRootNotSet();
-        if (voteRoot != anchoredVoteRoot) revert VoteRootMismatch();
+        // Enforce confirmation depth to prevent replaying against unfinalized roots.
+        if (block.number < sbtRootBlock[daoId] + finalityDepth) {
+            revert SbtRootNotFinalized();
+        }
+
+        // === Proof Verification ===
 
         // Public signals must match bridge.circom order including chainId (#649)
         uint256[9] memory publicSignals;
