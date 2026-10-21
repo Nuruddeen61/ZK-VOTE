@@ -4348,7 +4348,7 @@ impl Voting {
         }
     }
 
-    pub fn vote_with_circuit(
+            pub fn vote_with_circuit(
         env: Env,
         dao_id: u64,
         proposal_id: u64,
@@ -4360,6 +4360,11 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+
+        // ── DEFENSE-IN-DEPTH (#521): take the reentrancy lock before any
+        // ── state change or cross-contract call, like vote/vote_bls381 do.
+        Self::set_reentrancy_lock(&env);
+
         Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
         Self::assert_in_field(&env, PathContext::Anonymous, &root);
 
@@ -4385,6 +4390,11 @@ impl Voting {
         if proposal.end_time != 0 && now > proposal.end_time {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
+
+        // ── CHECKS-EFFECTS-INTERACTIONS (#521): burn the nullifier BEFORE any
+        // ── cross-contract call (tree root checks, circuit-registry lookup)
+        // ── or proof verification. A panic below rolls this back atomically.
+        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
 
         // Same helper `vote` and `cast_votes` use, rather than a third copy of
         // this match — the copies drifted, and the drift is what left the
@@ -4483,8 +4493,6 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidProof);
         }
 
-        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
-
         if vote_choice {
             proposal.yes_votes = proposal
                 .yes_votes
@@ -4498,6 +4506,9 @@ impl Voting {
         }
         env.storage().persistent().set(&prop_key, &proposal);
         Self::bump_persistent(&env, &prop_key);
+
+        // Release the reentrancy lock before emitting the event.
+        Self::clear_reentrancy_lock(&env);
 
         VoteEvent {
             dao_id,
