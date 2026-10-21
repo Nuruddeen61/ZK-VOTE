@@ -321,6 +321,7 @@ impl DaoRegistry {
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
     }
+
     fn enter(env: &Env) {
         if env
             .storage()
@@ -994,6 +995,7 @@ impl DaoRegistry {
         vk: VerificationKey,
     ) -> u64 {
         Self::bump_instance(&env);
+        Self::enter(&env);
         creator.require_auth();
 
         // Validate name length to prevent DoS
@@ -1062,6 +1064,8 @@ impl DaoRegistry {
             set_vk_args,
         );
 
+        Self::exit(&env);
+
         dao_id
     }
 
@@ -1089,6 +1093,7 @@ impl DaoRegistry {
         vk: VerificationKey,
     ) -> u64 {
         Self::bump_instance(&env);
+        Self::enter(&env);
         creator.require_auth();
 
         // Validate name length to prevent DoS
@@ -1162,6 +1167,8 @@ impl DaoRegistry {
             &Symbol::new(&env, "set_vk_from_registry"),
             set_vk_args,
         );
+
+        Self::exit(&env);
 
         dao_id
     }
@@ -1319,6 +1326,7 @@ impl DaoRegistry {
     /// replacing Wasm, so the registry remains a governance router.
     pub fn execute_contract_upgrade(env: Env, dao_id: u64, proposal_id: u64, executor: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         executor.require_auth();
         Self::require_dao_admin(&env, dao_id, &executor);
 
@@ -1360,6 +1368,8 @@ impl DaoRegistry {
             args,
         );
 
+        Self::exit(&env);
+
         ContractUpgradeExecutedEvent {
             dao_id,
             proposal_id,
@@ -1372,6 +1382,7 @@ impl DaoRegistry {
     /// Roll back an executed upgrade to the pre-approved rollback Wasm hash.
     pub fn rollback_contract_upgrade(env: Env, dao_id: u64, proposal_id: u64, executor: Address) {
         Self::bump_instance(&env);
+        Self::enter(&env);
         executor.require_auth();
         Self::require_dao_admin(&env, dao_id, &executor);
 
@@ -1403,6 +1414,8 @@ impl DaoRegistry {
             &Symbol::new(&env, "rollback_upgrade_from_registry"),
             args,
         );
+
+        Self::exit(&env);
 
         ContractRollbackEvent {
             dao_id,
