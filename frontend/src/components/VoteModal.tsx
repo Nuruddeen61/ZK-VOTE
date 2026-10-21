@@ -34,7 +34,14 @@ import {
   WalletSessionError,
 } from "../lib/walletSession";
 import { processEntry } from "../lib/queueProcessor";
-import { CheckCircle, XCircle, AlertTriangle, Loader2, X, WifiOff } from "lucide-react";
+import {
+  CheckCircle,
+  XCircle,
+  AlertTriangle,
+  Loader2,
+  X,
+  WifiOff,
+} from "lucide-react";
 import { useReceipts } from "../hooks/useReceipts";
 import VoteModeExplainer from "./ui/VoteModeExplainer";
 
@@ -48,6 +55,11 @@ interface VoteModalProps {
    * default — means the election uses the default circuit (#93).
    */
   merkleDepth?: number;
+  /** When present, use the encrypted-tally path (choice never public). */
+  encryption?: {
+    publicKey: { x: string; y: string };
+    epoch: number;
+  };
   /**
    * Candidate count bound into the vote circuit public signals.
    * Must match on-chain `ElectionConfig.num_candidates` (#645).
@@ -81,6 +93,7 @@ export default function VoteModal({
   voteMode,
   vkVersion: _vkVersion,
   merkleDepth = 0,
+  encryption,
   numCandidates,
   daoId,
   publicKey,
@@ -131,6 +144,34 @@ export default function VoteModal({
 
       // Initialize contract clients
       const clients = getZkVoteClient(publicKey);
+
+      // ENCRYPTED TALLY (vote-choice privacy): the choice is encrypted
+      // client-side and only ciphertext reaches the relayer/ledger. The
+      // plaintext path below is retained for legacy proposals created before
+      // the encrypted circuit was registered.
+      if (encryption && !panicMode) {
+        setProgress("Encrypting ballot...");
+        setStep("submitting");
+        const result = await clients.orchestrateEncryptedVote({
+          daoId,
+          proposalId,
+          choice,
+          kit: kit as never,
+          voteMode,
+          eligibleRoot,
+          encryptionPublicKey: {
+            x: BigInt(encryption.publicKey.x),
+            y: BigInt(encryption.publicKey.y),
+          },
+          epoch: encryption.epoch,
+        });
+        setProgress(
+          `Encrypted vote submitted (${result.ciphertext.c1.slice(0, 12)}...)`,
+        );
+        setStep("success");
+        onComplete();
+        return;
+      }
 
       // Step 1: Load registration data (or regenerate from wallet)
       //
@@ -398,7 +439,8 @@ export default function VoteModal({
 
       // Step 7: Deduplication check — if this nullifier is already in the
       // queue as submitted or conflict, surface that to the user.
-      const existingEntry = submissionQueue.getState().entries[votePayload.nullifier];
+      const existingEntry =
+        submissionQueue.getState().entries[votePayload.nullifier];
       if (existingEntry) {
         if (existingEntry.status === "submitted") {
           // Already successfully submitted — idempotent success
@@ -492,8 +534,7 @@ export default function VoteModal({
         revertOptimisticUpdate();
         setStep("error");
         setError(
-          finalEntry.lastError ||
-            "Vote submission failed. Please try again.",
+          finalEntry.lastError || "Vote submission failed. Please try again.",
         );
         return;
       }
@@ -732,7 +773,10 @@ export default function VoteModal({
                 </p>
               </div>
               <Alert className="text-xs text-left">
-                <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <AlertTriangle
+                  className="h-4 w-4 shrink-0"
+                  aria-hidden="true"
+                />
                 <span>
                   Do not cast this vote again — it will be submitted
                   automatically. A status notification will appear if any issue

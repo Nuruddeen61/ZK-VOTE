@@ -662,6 +662,46 @@ export const WEIGHTED_VOTE_KAT = {
  * @param zkeyPath Path to proving key, or an already-downloaded buffer
  * @returns Generated proof and public signals
  */
+/** Inputs for the encrypted-tally circuit (`vote_encrypted.circom`). */
+export interface EncryptedVoteProofInput {
+  root: string;
+  nullifier: string;
+  daoId: string;
+  proposalId: string;
+  numCandidates: string;
+  epoch: string;
+  publicKey: [string, string];
+  c1: [string, string];
+  cYes: [string, string];
+  cNo: [string, string];
+  relayerAddress: string;
+  // Private
+  voteChoice: string;
+  secret: string;
+  salt: string;
+  blindingFactor: string;
+  randomness: string;
+  pathElements: string[];
+  pathIndices: number[];
+}
+
+/**
+ * Generate a Groth16 proof for the encrypted ballot.
+ *
+ * The plaintext choice is a private witness; the public signals contain only
+ * the ElGamal ciphertext. This intentionally bypasses the Rust prover, whose
+ * artifacts target the legacy plaintext circuit, until the encrypted circuit is
+ * added to the prover's key registry.
+ */
+export async function generateEncryptedVoteProof(
+  input: EncryptedVoteProofInput,
+  wasmPath: string,
+  zkeyPath: string,
+): Promise<{ proof: Groth16Proof; publicSignals: string[] }> {
+  const snarkjs = await import("snarkjs");
+  return snarkjs.groth16.fullProve(input, wasmPath, zkeyPath);
+}
+
 export async function generateVoteProof(
   input: VoteProofInput,
   wasmPath: string | Uint8Array,

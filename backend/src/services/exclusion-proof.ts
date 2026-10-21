@@ -257,6 +257,140 @@ export async function recordRevocation(
   }
 }
 
+/** One atomic (epoch, root, witness) bundle served to a prover. */
+export interface EpochWitnessBundle {
+  daoId: number;
+  epoch: number;
+  root: string;
+  advancedAt: number;
+  commitment: string;
+  pathElements: string[];
+  pathIndices: number[];
+  fetchedAtLedger: number;
+}
+
+/**
+ * Minimal chain surface used to build an epoch witness. Injected so the
+ * TOCTOU-safe read can be unit-tested and so the relayer can point at either
+ * Soroban RPC or a cache.
+ */
+export interface EpochWitnessSource {
+  getLatestLedger(): Promise<number>;
+  getEpochInfo(daoId: number): Promise<{
+    epoch: number;
+    root: string;
+    advancedAt: number;
+  }>;
+  getMerklePath(params: {
+    daoId: number;
+    commitment: string;
+    root: string;
+  }): Promise<{ pathElements: string[]; pathIndices: number[] }>;
+}
+
+export class EpochWitnessChangedError extends Error {
+  constructor(message = "membership root changed while building witness") {
+    super(message);
+    this.name = "EpochWitnessChangedError";
+  }
+}
+
+/**
+ * Fetch (epoch, root, witness) atomically with respect to epoch rotation.
+ *
+ * A naive "read root -> read witness -> submit" sequence has a TOCTOU window:
+ * the registry can advance between the witness read and submission, letting a
+ * revoked member submit a proof anchored at the old epoch. We:
+ *   - read epoch/root before and after generating the path,
+ *   - require the same epoch, root and ledger snapshot,
+ *   - retry a bounded number of times.
+ *
+ * The voting contract repeats the epoch/root check on-chain; this is the
+ * off-chain half of the invariant.
+ */
+export async function fetchAtomicEpochWitness(
+  source: EpochWitnessSource,
+  params: {
+    daoId: number;
+    commitment: string;
+    /** Pin a specific epoch; defaults to the current one. */
+    epoch?: number;
+    maxAttempts?: number;
+  },
+): Promise<EpochWitnessBundle> {
+  const attempts = params.maxAttempts ?? 3;
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const ledgerBefore = await source.getLatestLedger();
+      const before = await source.getEpochInfo(params.daoId);
+      if (params.epoch != null && before.epoch !== params.epoch) {
+        throw new EpochWitnessChangedError(
+          `requested epoch ${params.epoch}, registry is at ${before.epoch}`,
+        );
+      }
+
+      const path = await source.getMerklePath({
+        daoId: params.daoId,
+        commitment: params.commitment,
+        root: before.root,
+      });
+
+      const ledgerAfter = await source.getLatestLedger();
+      const after = await source.getEpochInfo(params.daoId);
+      if (
+        before.epoch !== after.epoch ||
+        before.root !== after.root ||
+        ledgerBefore !== ledgerAfter
+      ) {
+        throw new EpochWitnessChangedError();
+      }
+
+      deps().log("info", "epoch_witness_served", {
+        daoId: params.daoId,
+        epoch: after.epoch,
+        root: after.root.slice(0, 12),
+        ledger: ledgerAfter,
+      });
+
+      return {
+        daoId: params.daoId,
+        epoch: after.epoch,
+        root: after.root,
+        advancedAt: after.advancedAt,
+        commitment: params.commitment,
+        pathElements: path.pathElements,
+        pathIndices: path.pathIndices,
+        fetchedAtLedger: ledgerAfter,
+      };
+    } catch (err) {
+      lastError = err as Error;
+      if (!(err instanceof EpochWitnessChangedError)) throw err;
+    }
+  }
+
+  throw (
+    lastError ?? new EpochWitnessChangedError("could not obtain a stable epoch witness")
+  );
+}
+
+/**
+ * True when a witness is still acceptable under the on-chain grace window.
+ * Mirrors `EPOCH_GRACE_SECS` in `contracts/voting/src/lib.rs`.
+ */
+export function isEpochWithinGrace(
+  bundle: Pick<EpochWitnessBundle, "epoch" | "advancedAt">,
+  currentEpoch: number,
+  currentEpochAdvancedAt: number,
+  nowSeconds: number,
+  graceSeconds = 300,
+): boolean {
+  if (bundle.epoch === currentEpoch) return true;
+  if (bundle.epoch > currentEpoch) return false;
+  return nowSeconds <= currentEpochAdvancedAt + graceSeconds;
+}
+
 export async function recordReinstatement(
   commitment: string,
   daoId: number,

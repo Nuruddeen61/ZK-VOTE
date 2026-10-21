@@ -297,12 +297,6 @@ mod mock_transcript_registry {
                 .set(&DataKey::Attestation(transcript_hash, vk_hash), &attested);
         }
 
-        pub fn set_attest_all(env: Env, attest_all: bool) {
-            env.storage()
-                .persistent()
-                .set(&DataKey::AttestAll(attest_all), &attest_all);
-        }
-
         pub fn is_vk_attested(env: Env, vk_hash: BytesN<32>) -> bool {
             if let Some(explicit) = env
                 .storage()
@@ -5107,7 +5101,7 @@ fn test_effective_num_candidates_is_always_satisfiable() {
     assert_eq!(voting.get_effective_num_candidates(&1, &proposal_id), 2);
 
     // A configured value is passed through unchanged.
-    voting.set_election_config(&1, &proposal_id, &0, &0, &7);
+    voting.set_election_config(&1, &proposal_id, &0, &0, &7, &admin);
     assert_eq!(voting.get_num_candidates(&1, &proposal_id), 7);
     assert_eq!(voting.get_effective_num_candidates(&1, &proposal_id), 7);
 }
