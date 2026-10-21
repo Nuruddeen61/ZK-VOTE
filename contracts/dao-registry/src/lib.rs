@@ -1323,6 +1323,12 @@ impl DaoRegistry {
             panic_with_error!(&env, RegistryError::UpgradeExpired);
         }
 
+        // Effects first (CEI): commit state before the external call
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+        Self::bump_persistent(&env, &key);
+
+        // Interaction last
         let args = soroban_sdk::vec![
             &env,
             proposal.wasm_hash.clone().into_val(&env),
@@ -1336,10 +1342,6 @@ impl DaoRegistry {
             &Symbol::new(&env, "apply_upgrade_from_registry"),
             args,
         );
-
-        proposal.executed = true;
-        env.storage().persistent().set(&key, &proposal);
-        Self::bump_persistent(&env, &key);
 
         ContractUpgradeExecutedEvent {
             dao_id,
@@ -1367,6 +1369,12 @@ impl DaoRegistry {
             panic_with_error!(&env, RegistryError::UpgradeInvalidWindow);
         }
 
+        // Effects first (CEI): commit state before the external call
+        proposal.rolled_back = true;
+        env.storage().persistent().set(&key, &proposal);
+        Self::bump_persistent(&env, &key);
+
+        // Interaction last
         let args = soroban_sdk::vec![
             &env,
             proposal.rollback_wasm_hash.clone().into_val(&env),
@@ -1378,10 +1386,6 @@ impl DaoRegistry {
             &Symbol::new(&env, "rollback_upgrade_from_registry"),
             args,
         );
-
-        proposal.rolled_back = true;
-        env.storage().persistent().set(&key, &proposal);
-        Self::bump_persistent(&env, &key);
 
         ContractRollbackEvent {
             dao_id,
