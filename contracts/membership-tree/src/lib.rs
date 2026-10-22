@@ -1,235 +1,195 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, 
-    panic_with_error, Address, Env, Symbol, symbol_short
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, IntoVal, Symbol, Vec, U256,
 };
+
+mod poseidon_params;
+mod poseidon_params_bls12_381;
+
+const SBT_CONTRACT: Symbol = symbol_short!("sbt");
+const REGISTRY: Symbol = symbol_short!("registry");
+const VOTING_CONTRACT_KEY: Symbol = symbol_short!("voting");
+const DEFAULT_MAX_ROOTS: u32 = 30;
+const MIN_MAX_ROOTS: u32 = 10;
+const MAX_MAX_ROOTS: u32 = 100;
+const MAX_TREE_DEPTH: u32 = 18;
+const MIN_REGISTRATION_INTERVAL_SECS: u64 = 3600;
+const ZEROS_CACHE: Symbol = symbol_short!("zeros");
+const ZEROS_CACHE_BLS: Symbol = symbol_short!("z_bls");
+const VERSION: u32 = 2;
+const VERSION_KEY: Symbol = symbol_short!("ver");
 
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
 const INSTANCE_TTL_EXTEND: u32 = 6_312_000;
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
 const PERSISTENT_TTL_EXTEND: u32 = 6_312_000;
+pub const SWEEP_MAX_RECORDS: u32 = 50;
+
+const POSEIDON_MDS: Symbol = symbol_short!("pos_mds");
+const POSEIDON_RC: Symbol = symbol_short!("pos_rc");
+const POSEIDON_MDS_BLS: Symbol = symbol_short!("mds_bl");
+const POSEIDON_RC_BLS: Symbol = symbol_short!("rc_bls");
+
+#[contracterror]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum TreeError {
+    NotAdmin = 1, InvalidDepth = 2, TreeInitialized = 3, TreeNotInitialized = 4,
+    CommitmentExists = 5, MemberExists = 6, TreeFull = 7, NoSbt = 8, NotOpenMembership = 9,
+    LeafOutOfBounds = 10, MemberRemoved = 11, MemberNotInTree = 12, RootNotFound = 13,
+    AlreadyInitialized = 14, MemberNotRevoked = 15, CommitmentAlreadyUsed = 16,
+    RateLimited = 17, MaxRootsOutOfRange = 18, RootPinnedByProposal = 19,
+    Sha3TreeNotInitialized = 20, PqCommitmentExists = 21, InvalidField = 22,
+    CommitmentPending = 23, CommitmentNotPending = 24, CommitmentRevealTooEarly = 25,
+    CommitmentHashMismatch = 26, UnknownEpoch = 27, ReentrantCall = 28,
+}
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    Member(u64, Address),
-    Alias(u64, Address),
-    Revoked(u64, Address),
-    MemberCount(u64),
-    MemberAtIndex(u64, u64),
-    TransferCooldown(u64, Address),
-    InActiveElection(u64, Address),
-    Admin(u64),
-    Registry,
+    TreeDepth(u64), NextLeafIndex(u64), FilledSubtrees(u64), Roots(u64),
+    LeafIndex(u64, U256), MemberLeafIndex(u64, Address), LeafValue(u64, u32),
+    NextRootIndex(u64), RootIndex(u64, U256), RevokedAt(u64, U256),
+    ReinstatedAt(u64, U256), NodeHash(u64, u32, u32), MinValidRootIdx(u64),
+    PoseidonField(u64), CommitmentUsed(u64, U256), MaxRoots(u64),
+    LastRegistrationAt(u64, Address), Sha3Roots(u64), Sha3NextRootIdx(u64),
+    Sha3RootIndex(u64, U256), PqCommitment(U256),
+    PendingRegistration(u64, Address), CommitmentSaltHash(u64, BytesN<32>),
+    Epoch(u64), EpochRoot(u64, u32), EpochAdvancedAt(u64, u32),
     ReentrancyLock,
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum SbtError {
-    NotAdmin = 1,
-    AlreadyMember = 2,
-    NotMember = 3,
-    RevokedMember = 4,
-    CooldownActive = 5,
-    InElection = 6,
-    AlreadyInitialized = 7,
-    ReentrantCall = 20,
-}
+#[contracttype] #[derive(Clone, Debug, PartialEq)]
+pub struct PendingRegistration { pub commitment_hash: BytesN<32>, pub committed_at_ledger: u32, pub committed_at: u64, }
 
-#[contract]
-pub struct MembershipSbt;
+#[contracttype] #[derive(Clone, Debug, PartialEq)]
+pub struct EpochInfo { pub epoch: u32, pub root: U256, pub advanced_at: u64, }
+
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct TreeInitEvent { #[topic] pub dao_id: u64, pub depth: u32, pub empty_root: U256, pub root_index: u32, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct CommitEvent { #[topic] pub dao_id: u64, pub commitment: U256, pub index: u32, pub new_root: U256, pub root_index: u32, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct RemovalEvent { #[topic] pub dao_id: u64, #[topic] pub member: Address, pub index: u32, pub new_root: U256, pub root_index: u32, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct ReinstatementEvent { #[topic] pub dao_id: u64, #[topic] pub member: Address, pub reinstated_at: u64, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct ContractUpgraded { pub from: u32, pub to: u32, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct RootEvictedEvent { #[topic] pub dao_id: u64, pub evicted_root: U256, pub roots_len_after: u32, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentCommittedEvent { #[topic] pub dao_id: u64, #[topic] pub member: Address, pub commitment_hash: BytesN<32>, pub committed_at_ledger: u32, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentRevealedEvent { #[topic] pub dao_id: u64, #[topic] pub member: Address, pub commitment: U256, pub index: u32, }
+#[soroban_sdk::contractevent] #[derive(Clone, Debug, PartialEq)]
+pub struct EpochAdvancedEvent { #[topic] pub dao_id: u64, pub epoch: u32, pub root: U256, pub advanced_at: u64, }
+
+#[contract] pub struct MembershipTree;
 
 #[contractimpl]
-impl MembershipSbt {
-    fn bump_instance(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+impl MembershipTree {
+    fn bump_instance(env: &Env) { env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND); }
+    fn bump_persistent<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
+        env.storage().persistent().extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
     }
-
     fn lock(env: &Env) {
-        if env.storage().instance().has(&DataKey::ReentrancyLock) {
-            panic_with_error!(env, SbtError::ReentrantCall);
-        }
+        if env.storage().instance().has(&DataKey::ReentrancyLock) { panic_with_error!(env, TreeError::ReentrantCall); }
         env.storage().instance().set(&DataKey::ReentrancyLock, &true);
     }
+    fn unlock(env: &Env) { env.storage().instance().remove(&DataKey::ReentrancyLock); }
 
-    fn unlock(env: &Env) {
-        env.storage().instance().remove(&DataKey::ReentrancyLock);
+    fn get_max_roots(env: &Env, dao_id: u64) -> u32 { env.storage().persistent().get(&DataKey::MaxRoots(dao_id)).unwrap_or(DEFAULT_MAX_ROOTS) }
+    fn voting_contract(env: &Env) -> Option<Address> { env.storage().instance().get(&VOTING_CONTRACT_KEY) }
+
+    pub fn set_voting_contract(env: Env, voting_contract: Address, registry: Address) {
+        Self::bump_instance(&env); registry.require_auth();
+        let expected: Address = env.storage().instance().get(&REGISTRY).unwrap_or_else(|| panic_with_error!(&env, TreeError::TreeNotInitialized));
+        if registry != expected { panic_with_error!(&env, TreeError::NotAdmin); }
+        env.storage().instance().set(&VOTING_CONTRACT_KEY, &voting_contract);
     }
-
-    fn bump_persistent<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    pub fn set_max_roots(env: Env, dao_id: u64, new_max: u32, admin: Address) {
+        Self::lock(&env); Self::bump_instance(&env); admin.require_auth();
+        let sbt_contract = Self::sbt_contract(&env);
+        let registry: Address = env.invoke_contract(&sbt_contract, &symbol_short!("registry"), soroban_sdk::vec![&env]);
+        let dao_admin: Address = env.invoke_contract(&registry, &symbol_short!("get_admin"), soroban_sdk::vec![&env, dao_id.into_val(&env)]);
+        if dao_admin != admin { Self::unlock(&env); panic_with_error!(&env, TreeError::NotAdmin); }
+        if new_max < MIN_MAX_ROOTS || new_max > MAX_MAX_ROOTS { Self::unlock(&env); panic_with_error!(&env, TreeError::MaxRootsOutOfRange); }
+        let key = DataKey::MaxRoots(dao_id); env.storage().persistent().set(&key, &new_max); Self::bump_persistent(&env, &key); Self::unlock(&env);
     }
-
-    fn is_admin(env: &Env, dao_id: u64, caller: &Address) -> bool {
-        if let Some(admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin(dao_id)) {
-            admin == *caller
-        } else {
-            false
-        }
-    }
-
-    pub fn __constructor(env: Env, registry: Address) {
-        if env.storage().instance().has(&DataKey::Registry) {
-            panic_with_error!(&env, SbtError::AlreadyInitialized);
-        }
-        env.storage().instance().set(&DataKey::Registry, &registry);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
-    }
-
-    pub fn initialize(env: Env, dao_id: u64, admin: Address) {
+    pub fn max_roots(env: Env, dao_id: u64) -> u32 { Self::bump_instance(&env); Self::get_max_roots(&env, dao_id) }
+    pub fn roots_len(env: Env, dao_id: u64) -> u32 {
         Self::bump_instance(&env);
-        let registry: Address = env.storage().instance().get(&DataKey::Registry)
-            .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotAdmin));
+        let roots: Vec<U256> = env.storage().persistent().get(&DataKey::Roots(dao_id)).unwrap_or_else(|| panic_with_error!(&env, TreeError::TreeNotInitialized));
+        roots.len()
+    }
+    fn check_root_eviction_safety(env: &Env, dao_id: u64, candidate_root: &U256) {
+        let Some(voting_addr) = Self::voting_contract(env) else { return; };
+        let is_pinned: bool = env.invoke_contract(&voting_addr, &symbol_short!("root_pin"), soroban_sdk::vec![env, dao_id.into_val(env), candidate_root.clone().into_val(env)]);
+        if is_pinned { panic_with_error!(env, TreeError::RootPinnedByProposal); }
+        let _: () = env.invoke_contract(&voting_addr, &symbol_short!("chk_risk"), soroban_sdk::vec![env, dao_id.into_val(env), candidate_root.clone().into_val(env)]);
+    }
+    fn evict_oldest_root(env: &Env, dao_id: u64, roots: &mut Vec<U256>) {
+        if let Some(evicted_root) = roots.get(0) {
+            let evicted_key = DataKey::RootIndex(dao_id, evicted_root.clone()); env.storage().persistent().remove(&evicted_key);
+            let mut new_roots = Vec::new(env); for i in 1..roots.len() { if let Some(r) = roots.get(i) { new_roots.push_back(r); } }
+            *roots = new_roots;
+            RootEvictedEvent { dao_id, evicted_root, roots_len_after: roots.len() }.publish(env);
+        }
+    }
+    pub fn __constructor(env: Env, sbt_contract: Address, registry: Address) {
+        if env.storage().instance().has(&VERSION_KEY) { panic_with_error!(&env, TreeError::AlreadyInitialized); }
+        env.storage().instance().set(&VERSION_KEY, &VERSION);
+        ContractUpgraded { from: 0, to: VERSION }.publish(&env);
+        env.storage().instance().set(&SBT_CONTRACT, &sbt_contract);
+        env.storage().instance().set(&REGISTRY, &registry);
+        Self::ensure_zeros_cache(&env);
+    }
+    fn sbt_contract(env: &Env) -> Address { env.storage().instance().get(&SBT_CONTRACT).unwrap_or_else(|| panic_with_error!(env, TreeError::TreeNotInitialized)) }
+
+    pub fn init_tree(env: Env, dao_id: u64, depth: u32, field: Symbol, admin: Address) {
+        Self::lock(&env); Self::bump_instance(&env); admin.require_auth();
+        let sbt_contract: Address = Self::sbt_contract(&env);
+        let registry: Address = env.invoke_contract(&sbt_contract, &symbol_short!("registry"), soroban_sdk::vec![&env]);
+        let dao_admin: Address = env.invoke_contract(&registry, &symbol_short!("get_admin"), soroban_sdk::vec![&env, dao_id.into_val(&env)]);
+        if dao_admin != admin { Self::unlock(&env); panic_with_error!(&env, TreeError::NotAdmin); }
+        if depth == 0 || depth > MAX_TREE_DEPTH { Self::unlock(&env); panic_with_error!(&env, TreeError::InvalidDepth); }
+        Self::assert_valid_field(&env, &field);
+        let depth_key = DataKey::TreeDepth(dao_id);
+        if env.storage().persistent().has(&depth_key) { Self::unlock(&env); panic_with_error!(&env, TreeError::TreeInitialized); }
+        env.storage().persistent().set(&depth_key, &depth); Self::bump_persistent(&env, &depth_key);
+        let next_leaf_key = DataKey::NextLeafIndex(dao_id); env.storage().persistent().set(&next_leaf_key, &0u32); Self::bump_persistent(&env, &next_leaf_key);
+        let field_key = DataKey::PoseidonField(dao_id); env.storage().persistent().set(&field_key, &field); Self::bump_persistent(&env, &field_key);
+        let next_root_key = DataKey::NextRootIndex(dao_id); env.storage().persistent().set(&next_root_key, &0u32); Self::bump_persistent(&env, &next_root_key);
+        let mut filled = Vec::new(&env); for level in 0..depth { filled.push_back(Self::zero_at_level_for_field(&env, level, &field)); }
+        let filled_key = DataKey::FilledSubtrees(dao_id); env.storage().persistent().set(&filled_key, &filled); Self::bump_persistent(&env, &filled_key);
+        let empty_root = Self::zero_at_level_for_field(&env, depth, &field);
+        let mut roots = Vec::new(&env); roots.push_back(empty_root.clone());
+        let roots_key = DataKey::Roots(dao_id); env.storage().persistent().set(&roots_key, &roots); Self::bump_persistent(&env, &roots_key);
+        let root_idx_key = DataKey::RootIndex(dao_id, empty_root.clone()); env.storage().persistent().set(&root_idx_key, &0u32); Self::bump_persistent(&env, &root_idx_key);
+        Self::init_epoch_zero(&env, dao_id, empty_root.clone());
+        TreeInitEvent { dao_id, depth, empty_root, root_index: 0 }.publish(&env); Self::unlock(&env);
+    }
+
+    pub fn init_tree_from_registry(env: Env, dao_id: u64, depth: u32, field: Symbol) {
+        Self::lock(&env); Self::bump_instance(&env);
+        let registry: Address = env.storage().instance().get(&REGISTRY).unwrap_or_else(|| panic_with_error!(&env, TreeError::NotAdmin));
         registry.require_auth();
-
-        if env.storage().instance().has(&DataKey::Admin(dao_id)) {
-            panic_with_error!(&env, SbtError::AlreadyInitialized);
-        }
-        env.storage().instance().set(&DataKey::Admin(dao_id), &admin);
-        env.storage().instance().set(&DataKey::MemberCount(dao_id), &0u64);
+        if depth == 0 || depth > MAX_TREE_DEPTH { Self::unlock(&env); panic_with_error!(&env, TreeError::InvalidDepth); }
+        Self::assert_valid_field(&env, &field);
+        let depth_key = DataKey::TreeDepth(dao_id);
+        if env.storage().persistent().has(&depth_key) { Self::unlock(&env); panic_with_error!(&env, TreeError::TreeInitialized); }
+        env.storage().persistent().set(&depth_key, &depth); Self::bump_persistent(&env, &depth_key);
+        let next_leaf_key = DataKey::NextLeafIndex(dao_id); env.storage().persistent().set(&next_leaf_key, &0u32); Self::bump_persistent(&env, &next_leaf_key);
+        let field_key = DataKey::PoseidonField(dao_id); env.storage().persistent().set(&field_key, &field); Self::bump_persistent(&env, &field_key);
+        let next_root_key = DataKey::NextRootIndex(dao_id); env.storage().persistent().set(&next_root_key, &0u32); Self::bump_persistent(&env, &next_root_key);
+        let mut filled = Vec::new(&env); for level in 0..depth { filled.push_back(Self::zero_at_level_for_field(&env, level, &field)); }
+        let filled_key = DataKey::FilledSubtrees(dao_id); env.storage().persistent().set(&filled_key, &filled); Self::bump_persistent(&env, &filled_key);
+        let empty_root = Self::zero_at_level_for_field(&env, depth, &field);
+        let mut roots = Vec::new(&env); roots.push_back(empty_root.clone());
+        let roots_key = DataKey::Roots(dao_id); env.storage().persistent().set(&roots_key, &roots); Self::bump_persistent(&env, &roots_key);
+        let root_idx_key = DataKey::RootIndex(dao_id, empty_root.clone()); env.storage().persistent().set(&root_idx_key, &0u32); Self::bump_persistent(&env, &root_idx_key);
+        Self::init_epoch_zero(&env, dao_id, empty_root.clone());
+        TreeInitEvent { dao_id, depth, empty_root, root_index: 0 }.publish(&env); Self::unlock(&env);
     }
 
-    pub fn init_from_registry(env: Env, dao_id: u64, admin: Address) {
-        Self::bump_instance(&env);
-        let registry: Address = env.storage().instance().get(&DataKey::Registry)
-            .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotAdmin));
-        registry.require_auth();
-
-        if env.storage().instance().has(&DataKey::Admin(dao_id)) {
-            return;
-        }
-        env.storage().instance().set(&DataKey::Admin(dao_id), &admin);
-        env.storage().instance().set(&DataKey::MemberCount(dao_id), &0u64);
-    }
-
-    pub fn mint(env: Env, dao_id: u64, member: Address, alias: Symbol, admin: Address) {
-        Self::lock(&env);
-        admin.require_auth();
-        Self::bump_instance(&env);
-
-        if !Self::is_admin(&env, dao_id, &admin) {
-            Self::unlock(&env);
-            panic_with_error!(&env, SbtError::NotAdmin);
-        }
-
-        let member_key = DataKey::Member(dao_id, member.clone());
-        if env.storage().persistent().has(&member_key) {
-            Self::unlock(&env);
-            panic_with_error!(&env, SbtError::AlreadyMember);
-        }
-
-        if let Some(cooldown_end) = env.storage().persistent().get::<DataKey, u64>(&DataKey::TransferCooldown(dao_id, member.clone())) {
-            if env.ledger().timestamp() < cooldown_end {
-                Self::unlock(&env);
-                panic_with_error!(&env, SbtError::CooldownActive);
-            }
-        }
-
-        env.storage().persistent().set(&member_key, &true);
-        env.storage().persistent().set(&DataKey::Alias(dao_id, member.clone()), &alias);
-        env.storage().persistent().set(&DataKey::Revoked(dao_id, member.clone()), &false);
-        env.storage().persistent().set(&DataKey::InActiveElection(dao_id, member.clone()), &false);
-
-        let count: u64 = env.storage().instance().get(&DataKey::MemberCount(dao_id)).unwrap_or(0);
-        env.storage().persistent().set(&DataKey::MemberAtIndex(dao_id, count), &member.clone());
-        env.storage().instance().set(&DataKey::MemberCount(dao_id), &(count + 1));
-
-        Self::bump_persistent(&env, &member_key);
-        Self::bump_persistent(&env, &DataKey::Alias(dao_id, member.clone()));
-        Self::bump_persistent(&env, &DataKey::MemberAtIndex(dao_id, count));
-
-        Self::unlock(&env);
-    }
-
-    pub fn burn(env: Env, dao_id: u64, member: Address, admin: Address) {
-        Self::lock(&env);
-        admin.require_auth();
-        Self::bump_instance(&env);
-
-        if !Self::is_admin(&env, dao_id, &admin) {
-            Self::unlock(&env);
-            panic_with_error!(&env, SbtError::NotAdmin);
-        }
-
-        let member_key = DataKey::Member(dao_id, member.clone());
-        if !env.storage().persistent().has(&member_key) {
-            Self::unlock(&env);
-            panic_with_error!(&env, SbtError::NotMember);
-        }
-
-        if let Some(true) = env.storage().persistent().get::<DataKey, bool>(&DataKey::InActiveElection(dao_id, member.clone())) {
-            Self::unlock(&env);
-            panic_with_error!(&env, SbtError::InElection);
-        }
-
-        env.storage().persistent().remove(&member_key);
-        env.storage().persistent().set(&DataKey::Revoked(dao_id, member.clone()), &true);
-        env.storage().persistent().set(&DataKey::TransferCooldown(dao_id, member.clone()), &(env.ledger().timestamp() + 86400));
-        
-        Self::bump_persistent(&env, &DataKey::Revoked(dao_id, member.clone()));
-
-        Self::unlock(&env);
-    }
-
-    pub fn revoke(env: Env, dao_id: u64, member: Address, admin: Address) {
-        Self::burn(env, dao_id, member, admin);
-    }
-
-    pub fn has(env: Env, dao_id: u64, member: Address) -> bool {
-        Self::bump_instance(&env);
-        env.storage().persistent().has(&DataKey::Member(dao_id, member))
-    }
-
-    pub fn is_revoked(env: Env, dao_id: u64, member: Address) -> bool {
-        Self::bump_instance(&env);
-        env.storage().persistent().get(&DataKey::Revoked(dao_id, member)).unwrap_or(false)
-    }
-
-    pub fn member_count(env: Env, dao_id: u64) -> u64 {
-        Self::bump_instance(&env);
-        env.storage().instance().get(&DataKey::MemberCount(dao_id)).unwrap_or(0)
-    }
-
-    pub fn get_member_at(env: Env, dao_id: u64, index: u64) -> Option<Address> {
-        Self::bump_instance(&env);
-        let key = DataKey::MemberAtIndex(dao_id, index);
-        let addr: Option<Address> = env.storage().persistent().get(&key);
-        if addr.is_some() {
-            Self::bump_persistent(&env, &key);
-        }
-        addr
-    }
-
-    pub fn registry(env: Env) -> Address {
-        Self::bump_instance(&env);
-        env.storage().instance().get(&DataKey::Registry).unwrap()
-    }
-
-    pub fn get_admin(env: Env, dao_id: u64) -> Option<Address> {
-        Self::bump_instance(&env);
-        env.storage().instance().get(&DataKey::Admin(dao_id))
-    }
-
-    // Keepalive for #audit-H1
-    pub fn sweep_dao(env: Env, dao_id: u64, start: u64, limit: u32) -> u32 {
-        Self::bump_instance(&env);
-        let limit = if limit == 0 || limit > 50 { 50 } else { limit };
-        let mut refreshed = 0u32;
-        let count = Self::member_count(env.clone(), dao_id);
-        let end = (start + limit as u64).min(count);
-        for i in start..end {
-            if let Some(member) = Self::get_member_at(env.clone(), dao_id, i) {
-                Self::bump_persistent(&env, &DataKey::Member(dao_id, member.clone()));
-                Self::bump_persistent(&env, &DataKey::Alias(dao_id, member.clone()));
-                Self::bump_persistent(&env, &DataKey::Revoked(dao_id, member.clone()));
-                refreshed += 1;
-            }
-        }
-        refreshed
-    }
-}
+    fn init_epoch
